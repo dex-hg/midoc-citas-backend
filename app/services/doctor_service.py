@@ -1,4 +1,4 @@
-"""Consultas y preparación de estados del doctor, sin persistencia concreta."""
+"""Consultas y registro de resultados de atención del doctor."""
 
 import re
 from collections.abc import Sequence
@@ -8,7 +8,7 @@ from typing import Protocol
 
 
 ESTADOS_CITA = frozenset({"AGENDADA", "ATENDIDA", "CANCELADA", "NO_ASISTIO"})
-ESTADOS_PREPARABLES = frozenset({"ATENDIDA", "NO_ASISTIO"})
+ESTADOS_RESULTADO = frozenset({"ATENDIDA", "NO_ASISTIO"})
 ZONA_HORARIA_LIMA = timezone(timedelta(hours=-5))
 
 
@@ -28,13 +28,13 @@ class RepositorioDoctorNoDisponible(RuntimeError):
     """El proveedor de citas no está configurado o no puede responder."""
 
 
+class AccesoDoctorDenegado(PermissionError):
+    """El usuario autenticado no tiene una cuenta de MiDoc habilitada."""
+
+
 @dataclass(frozen=True)
 class CitaDoctor:
-    """Contrato interno del módulo; no representa una tabla de base de datos.
-
-    El futuro adaptador entregará fechas y horas locales de Lima sin zona
-    horaria. Los identificadores pueden ser enteros positivos, UUID o códigos.
-    """
+    """Cita con fecha y hora locales de Lima, independiente del almacenamiento."""
 
     id_cita: str
     id_doctor: str
@@ -47,15 +47,38 @@ class CitaDoctor:
     estado: str
 
 
-class RepositorioDoctor(Protocol):
-    """Puerto de lectura que podrá implementar cualquier tecnología de datos."""
+@dataclass(frozen=True)
+class PerfilDoctor:
+    id_doctor: str
+    id_usuario: str
+    nombre: str
+    especialidad: str
+    sede: str
 
-    def listar_citas(self, id_doctor: str) -> Sequence[CitaDoctor]:
+
+class RepositorioDoctor(Protocol):
+    """Acceso al perfil, las citas y los resultados de atención."""
+
+    def listar_citas(
+        self, id_doctor: str, *, fecha: date | None, estado: str | None
+    ) -> Sequence[CitaDoctor]:
         """Devuelve las citas del doctor o lanza RepositorioDoctorNoDisponible."""
         ...
 
     def obtener_cita(self, id_doctor: str, id_cita: str) -> CitaDoctor | None:
         """Busca una cita del doctor; devuelve None cuando no existe."""
+        ...
+
+    def obtener_perfil(
+        self, *, id_doctor: str | None, id_usuario: str | None
+    ) -> PerfilDoctor | None:
+        ...
+
+    def registrar_resultado(self, id_doctor: str, id_cita: str, estado: str) -> str:
+        """Aplica la transición de estado y devuelve el resultado de la escritura."""
+        ...
+
+    def verificar_token(self, token: str) -> dict | None:
         ...
 
 
@@ -64,6 +87,11 @@ class ServicioDoctor:
 
     def __init__(self, repositorio: RepositorioDoctor | None = None):
         self._repositorio = repositorio
+
+    def verificar_token(self, token: str) -> dict | None:
+        if len(token) > 8192 or not re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2}", token):
+            return None
+        return self._obtener_repositorio().verificar_token(token)
 
     @staticmethod
     def validar_identificador(valor: object, nombre: str) -> str:
@@ -105,7 +133,9 @@ class ServicioDoctor:
         estado_filtro = self.validar_estado(estado) if estado is not None else None
         repositorio = self._obtener_repositorio()
         try:
-            citas = repositorio.listar_citas(identificador)
+            citas = repositorio.listar_citas(
+                identificador, fecha=fecha_filtro, estado=estado_filtro
+            )
         except OSError as error:
             raise RepositorioDoctorNoDisponible(
                 "No se pudieron consultar las citas. Inténtalo nuevamente."
@@ -154,11 +184,7 @@ class ServicioDoctor:
         identificador_cita = self.validar_identificador(
             id_cita, "identificador de la cita"
         )
-        estado_solicitado = self.validar_estado(estado)
-        if estado_solicitado not in ESTADOS_PREPARABLES:
-            raise ErrorValidacionDoctor(
-                "El doctor solo puede preparar estados ATENDIDA o NO_ASISTIO."
-            )
+        estado_solicitado = self._validar_estado_resultado(estado)
         repositorio = self._obtener_repositorio()
         try:
             registro = repositorio.obtener_cita(identificador, identificador_cita)
@@ -186,6 +212,68 @@ class ServicioDoctor:
                 "Cambio validado. Su registro en la base de datos está pendiente."
             ),
         }
+
+    def consultar_perfil(
+        self, *, id_doctor: str | None = None, id_usuario: str | None = None
+    ) -> dict | None:
+        repositorio = self._obtener_repositorio()
+        perfil = repositorio.obtener_perfil(id_doctor=id_doctor, id_usuario=id_usuario)
+        if perfil is None:
+            return None
+        if (
+            (id_doctor is not None and perfil.id_doctor != id_doctor)
+            or (id_usuario is not None and perfil.id_usuario != id_usuario)
+        ):
+            return None
+        return {
+            "id_doctor": perfil.id_doctor,
+            "nombre": perfil.nombre,
+            "especialidad": perfil.especialidad,
+            "sede": perfil.sede,
+        }
+
+    def registrar_resultado(
+        self, id_doctor: object, id_cita: object, estado: object
+    ) -> dict:
+        identificador = self.validar_identificador(
+            id_doctor, "identificador del doctor"
+        )
+        identificador_cita = self.validar_identificador(
+            id_cita, "identificador de la cita"
+        )
+        estado_solicitado = self._validar_estado_resultado(estado)
+        repositorio = self._obtener_repositorio()
+        resultado = repositorio.registrar_resultado(
+            identificador, identificador_cita, estado_solicitado
+        )
+        if resultado == "NO_ENCONTRADA":
+            raise CitaDoctorNoEncontrada("No se encontró la cita del doctor.")
+        if resultado == "NO_INICIADA":
+            raise CambioEstadoDoctorNoPermitido(
+                "Podrás registrar el resultado desde el inicio de la cita."
+            )
+        if resultado == "NO_PERMITIDA":
+            raise CambioEstadoDoctorNoPermitido(
+                "Solo puedes registrar el resultado de una cita agendada."
+            )
+        if resultado != "REGISTRADA":
+            raise RepositorioDoctorNoDisponible(
+                "No se pudo confirmar el registro del resultado."
+            )
+        return {
+            "id_cita": identificador_cita,
+            "estado": estado_solicitado,
+            "persistido": True,
+        }
+
+    @classmethod
+    def _validar_estado_resultado(cls, estado: object) -> str:
+        estado_solicitado = cls.validar_estado(estado)
+        if estado_solicitado not in ESTADOS_RESULTADO:
+            raise ErrorValidacionDoctor(
+                "El resultado debe ser ATENDIDA o NO_ASISTIO."
+            )
+        return estado_solicitado
 
     def _obtener_repositorio(self) -> RepositorioDoctor:
         if self._repositorio is None:

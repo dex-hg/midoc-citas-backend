@@ -6,6 +6,7 @@ from flask import Blueprint, abort, current_app, g, jsonify, request
 from werkzeug.exceptions import HTTPException
 
 from app.services.doctor_service import (
+    AccesoDoctorDenegado,
     CambioEstadoDoctorNoPermitido,
     CitaDoctorNoEncontrada,
     ErrorValidacionDoctor,
@@ -19,6 +20,18 @@ doctor_bp = Blueprint("doctor", __name__, url_prefix="/api/doctores")
 @doctor_bp.get("/health")
 def consultar_salud():
     return jsonify({"modulo": "doctores", "status": "ok"}), 200
+
+
+@doctor_bp.after_request
+def evitar_cache_clinica(respuesta):
+    respuesta.headers["Cache-Control"] = "no-store"
+    return respuesta
+
+
+@doctor_bp.get("/perfil")
+def consultar_perfil():
+    referencia = _obtener_referencia_doctor()
+    return jsonify(_obtener_perfil_autenticado(referencia)), 200
 
 
 @doctor_bp.get("/agenda")
@@ -40,6 +53,22 @@ def consultar_citas():
 @doctor_bp.post("/citas/<id_cita>/preparar-estado")
 def preparar_estado_cita(id_cita: str):
     id_doctor = _obtener_doctor_autenticado()
+    resultado = _obtener_servicio().preparar_estado_cita(
+        id_doctor, id_cita, _leer_estado()
+    )
+    return jsonify(resultado), 200
+
+
+@doctor_bp.patch("/citas/<id_cita>/estado")
+def registrar_resultado(id_cita: str):
+    id_doctor = _obtener_doctor_autenticado()
+    resultado = _obtener_servicio().registrar_resultado(
+        id_doctor, id_cita, _leer_estado()
+    )
+    return jsonify(resultado), 200
+
+
+def _leer_estado():
     if request.args:
         raise ErrorValidacionDoctor("Esta operación no acepta parámetros en la URL.")
     if not request.is_json:
@@ -50,25 +79,42 @@ def preparar_estado_cita(id_cita: str):
     datos = request.get_json(silent=True)
     if not isinstance(datos, dict) or set(datos) != {"estado"}:
         raise ErrorValidacionDoctor("El cuerpo JSON debe contener únicamente 'estado'.")
-    resultado = _obtener_servicio().preparar_estado_cita(
-        id_doctor, id_cita, datos["estado"]
-    )
-    return jsonify(resultado), 200
+    return datos["estado"]
 
 
 def _obtener_doctor_autenticado() -> str:
-    # Este contexto solo debe establecerlo un middleware que verifique la sesión.
+    referencia = _obtener_referencia_doctor()
+    if "id_doctor" in referencia:
+        return referencia["id_doctor"]
+    return _obtener_perfil_autenticado(referencia)["id_doctor"]
+
+
+def _obtener_perfil_autenticado(referencia: dict[str, str]) -> dict:
+    perfil = _obtener_servicio().consultar_perfil(**referencia)
+    if perfil is None:
+        abort(403, description="La cuenta no tiene un doctor asociado.")
+    return perfil
+
+
+def _obtener_referencia_doctor() -> dict[str, str]:
+    # La sesión compartida se establece en el servidor. Un Bearer se verifica con Auth.
     usuario = getattr(g, "usuario_autenticado", None)
+    if usuario is None:
+        autorizacion = request.authorization
+        if autorizacion is not None and autorizacion.type == "bearer" and autorizacion.token:
+            usuario = _obtener_servicio().verificar_token(autorizacion.token)
     if not isinstance(usuario, Mapping):
         abort(401, description="Se requiere una sesión autenticada de doctor.")
     if usuario.get("rol") != "DOCTOR" or usuario.get("activo") is not True:
         abort(403, description="Se requiere una cuenta activa con rol DOCTOR.")
+    campo = "id_doctor" if usuario.get("id_doctor") is not None else "id_usuario"
     try:
-        return ServicioDoctor.validar_identificador(
-            usuario.get("id_doctor"), "identificador del doctor"
+        identificador = ServicioDoctor.validar_identificador(
+            usuario.get(campo), "identificador de la sesión"
         )
     except ErrorValidacionDoctor:
         abort(403, description="La sesión no tiene un doctor válido asociado.")
+    return {campo: identificador}
 
 
 def _obtener_filtros() -> dict:
@@ -89,12 +135,14 @@ def _obtener_servicio() -> ServicioDoctor:
 
 
 @doctor_bp.errorhandler(ErrorValidacionDoctor)
+@doctor_bp.errorhandler(AccesoDoctorDenegado)
 @doctor_bp.errorhandler(CitaDoctorNoEncontrada)
 @doctor_bp.errorhandler(CambioEstadoDoctorNoPermitido)
 @doctor_bp.errorhandler(RepositorioDoctorNoDisponible)
 def manejar_error_doctor(error: Exception):
     errores = {
         ErrorValidacionDoctor: (400, "SOLICITUD_INVALIDA"),
+        AccesoDoctorDenegado: (403, "ACCESO_DOCTOR_DENEGADO"),
         CitaDoctorNoEncontrada: (404, "CITA_NO_ENCONTRADA"),
         CambioEstadoDoctorNoPermitido: (409, "CAMBIO_ESTADO_NO_PERMITIDO"),
         RepositorioDoctorNoDisponible: (503, "ALMACENAMIENTO_NO_DISPONIBLE"),

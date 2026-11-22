@@ -74,7 +74,9 @@ class RepositorioDoctorPrueba:
     def __init__(self, citas: list[CitaDoctor] | None = None):
         self.citas = tuple(crear_citas_prueba() if citas is None else citas)
 
-    def listar_citas(self, id_doctor: str) -> list[CitaDoctor]:
+    def listar_citas(
+        self, id_doctor: str, *, fecha: date | None = None, estado: str | None = None
+    ) -> list[CitaDoctor]:
         return [cita for cita in self.citas if cita.id_doctor == id_doctor]
 
     def obtener_cita(self, id_doctor: str, id_cita: str) -> CitaDoctor | None:
