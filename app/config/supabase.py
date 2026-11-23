@@ -17,7 +17,6 @@ def get_supabase() -> Client:
 
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 def get_supabase_admin() -> Client:
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 

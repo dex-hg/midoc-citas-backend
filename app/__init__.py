@@ -3,12 +3,14 @@ import os
 from flask import Flask, jsonify
 from flask_cors import CORS
 
+from app.repositories.doctor_repository import RepositorioDoctorSupabase
 from app.routes.auth_routes import auth_bp
 from app.routes.cliente_routes import cliente_bp
 from app.routes.doctor_routes import doctor_bp
 from app.routes.recepcion_routes import recepcion_bp
 from app.routes.promotor_routes import promotor_bp
 from app.routes.administrador_routes import administrador_bp
+from app.services.doctor_service import ServicioDoctor
 
 
 def create_app():
@@ -19,14 +21,14 @@ def create_app():
         "http://localhost:5173"
     )
 
-    CORS(
-        app,
-        resources={
-            r"/api/*": {
-                "origins": frontend_url
-            }
+    recursos_cors = {r"/api/*": {"origins": frontend_url}}
+    if frontend_url != "*":
+        recursos_cors[r"/api/doctores/.*"] = {
+            "origins": frontend_url,
+            "supports_credentials": True,
         }
-    )
+    CORS(app, resources=recursos_cors)
+    app.extensions["servicio_doctor"] = ServicioDoctor(RepositorioDoctorSupabase())
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(cliente_bp)
